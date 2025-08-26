@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+ExpertCheckpoints/
+LDM_Checkpoints/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+# .python-version
+.pytest_cache
+.ruff_cache
+
+
+test_adapters.py
+sample/
+synthRAD2025_Task1_Train/
+fulltransforms.py
+fulladapters.py
+del.py
+*h5
+oldvers/
