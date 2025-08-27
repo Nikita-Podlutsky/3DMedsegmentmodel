@@ -1,3 +1,4 @@
+# data_units.py
 # --- Стандартные библиотеки Python ---
 import os
 import pickle
@@ -41,24 +42,7 @@ SYNTHSTRIP_PROCESSING_CONFIG = {
     }
 }
 
-def pad_or_crop_to_shape(data, target_shape):
-    current_shape = data.shape
-    padded_data = np.zeros(target_shape, dtype=data.dtype)
-    slices = []
-    crop_slices = []
-    for i in range(3):
-        if current_shape[i] <= target_shape[i]:
-            start = (target_shape[i] - current_shape[i]) // 2
-            end = start + current_shape[i]
-            slices.append(slice(start, end))
-            crop_slices.append(slice(None))
-        else:
-            start = (current_shape[i] - target_shape[i]) // 2
-            end = start + target_shape[i]
-            slices.append(slice(None))
-            crop_slices.append(slice(start, end))
-    padded_data[tuple(slices)] = data[tuple(crop_slices)]
-    return padded_data
+
 
 
 def resize_volume(image_data, mask_data, target_shape):
@@ -124,8 +108,6 @@ def analyze_dataset_dimensions(dataset_dir):
     
     print("\nАнализ завершен. Используйте эту информацию, чтобы выбрать оптимальный target_shape.")
     return df
-
-
 
 
 def analyze_synthrad_dataset(dataset_dir):
@@ -227,17 +209,6 @@ def universal_preprocess_for_inference(raw_data, modality, golden_standard_shape
     normalized_data = normalize_golden_standard(processed_data, modality_clean)
     
     return normalized_data
-
-
-
-def normalize_mri(volume):
-    p0_5 = np.percentile(volume, 0.5)
-    p99_5 = np.percentile(volume, 99.5)
-    clipped = np.clip(volume, p0_5, p99_5)
-    foreground_voxels = clipped[clipped > 0]
-    if len(foreground_voxels) == 0: return clipped
-    mean, std = np.mean(foreground_voxels), np.std(foreground_voxels)
-    return (clipped - mean) / std if std > 0 else clipped - mean
 
 
 
@@ -585,7 +556,6 @@ def create_optimized_dataloaders(
     return train_loader, val_loader
 
 
-
 def pad_or_crop_to_shape(data, target_shape):
 
     current_shape = data.shape
@@ -722,3 +692,65 @@ def get_prepared_synthstrip_dataset(dataset_dir, h5_cache_path, config, force_cr
         print("Готовый файл не найден или принудительное создание. Начинаем подготовку...")
         create_prepared_synthstrip_h5(dataset_dir, h5_cache_path, config)
         return h5_cache_path
+
+
+
+
+class FullImageDataset(Dataset):
+    """
+    Dataset, который загружает и возвращает полные 3D-изображения из H5 файла.
+    Предназначен для продвинутого обучения, где требуется глобальный контекст.
+    """
+    def __init__(self, h5_path: str, augmentations: Optional[Any] = None):
+        self.h5_path = h5_path
+        self.augmentations = augmentations
+        
+        self.volumes_info = []
+        with h5py.File(h5_path, 'r') as hf:
+            self.modalities = sorted(list(hf.keys()))
+            self.modality_map = {name: i for i, name in enumerate(self.modalities)}
+            
+            print("Сканирование полных объемов для FullImageDataset...")
+            for modality in self.modalities:
+                num_volumes = len(hf[modality]['images'])
+                for vol_idx in range(num_volumes):
+                    self.volumes_info.append({
+                        'modality': modality,
+                        'volume_idx': vol_idx,
+                        'modality_label': self.modality_map[modality]
+                    })
+        print(f"Найдено {len(self.volumes_info)} полных 3D-объемов.")
+
+    def __len__(self) -> int:
+        return 2
+        return len(self.volumes_info)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        info = self.volumes_info[idx]
+        modality = info['modality']
+        volume_idx = info['volume_idx']
+
+        with h5py.File(self.h5_path, 'r') as hf:
+
+            image_volume = hf[modality]['images'][volume_idx][...]
+            mask_volume = hf[modality]['masks'][volume_idx][...]
+
+
+        image_tensor = torch.from_numpy(image_volume.transpose(3, 0, 1, 2)).float()
+        mask_tensor = torch.from_numpy(mask_volume.transpose(3, 0, 1, 2)).float()
+
+        if self.augmentations:
+            subject = tio.Subject(
+                image=tio.ScalarImage(tensor=image_tensor),
+                mask=tio.LabelMap(tensor=mask_tensor)
+            )
+            transformed = self.augmentations(subject)
+            image_tensor = transformed.image.data
+            mask_tensor = transformed.mask.data
+
+        return {
+            'image': image_tensor,
+            'mask': mask_tensor,
+            'modality_label': torch.tensor(info['modality_label'], dtype=torch.long),
+            'modality_name': modality
+        }

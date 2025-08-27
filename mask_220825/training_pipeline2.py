@@ -1,3 +1,4 @@
+# training_pipeline2.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +9,7 @@ from pathlib import Path
 from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE
 from augmentations import get_augmentations_transform
 from data_units import create_optimized_dataloaders
-
+import h5py
 
 class SimplifiedTrainer:
     
@@ -57,7 +58,7 @@ class SimplifiedTrainer:
         print("Настройка данных...")
         
         # Получаем количество модальностей
-        import h5py
+        
         with h5py.File(self.h5_path, 'r') as hf:
             self.num_modalities = len(list(hf.keys()))
         
@@ -463,8 +464,8 @@ class DiceBCELoss(nn.Module):
         inputs_sigmoid = torch.sigmoid(inputs)
         
         # Flatten для вычислений
-        inputs_flat = inputs_sigmoid.view(-1)
-        targets_flat = targets.view(-1)
+        inputs_flat = inputs_sigmoid.reshape(-1)
+        targets_flat = targets.reshape(-1)
         
         # Dice loss
         intersection = (inputs_flat * targets_flat).sum()
@@ -486,8 +487,8 @@ def main():
     # Конфигурация
     config = {
         'h5_path': r"C:\Users\pniki\Documents\Programs\Datasets\synthstrip_prepared_golden.h5",
-        'patch_size': (64, 64, 64),
-        'coarse_size': (32, 32, 32),
+        'patch_size': (32, 32, 32),
+        'coarse_size': (16, 16, 16),
         'batch_size': 2,
         'learning_rate': 1e-4,
         'num_epochs': 100,

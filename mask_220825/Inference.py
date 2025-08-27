@@ -1,131 +1,157 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from typing import Tuple
 import numpy as np
-from scipy.ndimage import gaussian_filter
 
-# Предполагается, что все ваши модели, конфиги и DEVICE уже определены
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-def predict_full_volume(
-    full_image, 
-    coarse_model, 
-    fine_model, 
-    config
-):
-    """
-    Выполняет предсказание для одного полного 3D-объема с использованием
-    sliding window inference для сглаживания и сборки патчей.
 
-    Args:
-        full_image (torch.Tensor): Входной 3D-объем (1, C, D, H, W) на DEVICE.
-        coarse_model (nn.Module): Обученная Coarse-модель.
-        fine_model (nn.Module): Обученная Fine-модель (MultiTask).
-        config (dict): Словарь с конфигурацией (PATCH_SIZE, COARSE_UNIFIED_SIZE и т.д.).
+try:
+    from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE
+except ImportError as e:
+    print(f"Ошибка импорта: {e}. Убедитесь, что файл models.py находится рядом.")
+    exit()
 
-    Returns:
-        torch.Tensor: Финальная маска сегментации (1, 1, D, H, W).
-    """
-    # Переводим модели в режим инференса
-    coarse_model.eval()
-    fine_model.eval()
+
+
+def create_coordinate_maps(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+    d, h, w = shape
+    d_coords = torch.linspace(-1, 1, d, device=device)
+    h_coords = torch.linspace(-1, 1, h, device=device)
+    w_coords = torch.linspace(-1, 1, w, device=device)
     
-    # Отключаем расчет градиентов для экономии памяти и ускорения
-    with torch.no_grad():
-        # --- Шаг 1: Получаем "подсказку" от Coarse-модели ---
-        coarse_input = F.interpolate(
-            full_image, 
-            size=config['COARSE_UNIFIED_SIZE'], 
-            mode='trilinear', 
-            align_corners=False
+    d_map = d_coords.view(d, 1, 1).expand(d, h, w)
+    h_map = h_coords.view(1, h, 1).expand(d, h, w)
+    w_map = w_coords.view(1, 1, w).expand(d, h, w)
+    
+    coord_maps = torch.stack([d_map, h_map, w_map], dim=0).unsqueeze(0)
+    return coord_maps
+
+def pad_or_crop_to_shape(data: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
+    current_shape = data.shape
+    result = np.zeros(target_shape, dtype=data.dtype)
+    
+    slices_in = tuple(
+        slice((cs - ts) // 2, (cs - ts) // 2 + ts) if cs > ts else slice(None)
+        for cs, ts in zip(current_shape, target_shape)
+    )
+    slices_out = tuple(
+        slice((ts - cs) // 2, (ts - cs) // 2 + cs) if cs < ts else slice(None)
+        for cs, ts in zip(current_shape, target_shape)
+    )
+    
+    result[slices_out] = data[slices_in]
+    return result
+
+# --- Основной класс ---
+
+class UnifiedPatchedModel(nn.Module):
+    def __init__(
+        self,
+        coarse_model: CoarseUNet_Medium,
+        fine_model: MultiTask_FineUNet_MoE,
+        coarse_size: Tuple[int, int, int],
+        patch_size: Tuple[int, int, int],
+        patch_overlap: Tuple[int, int, int],
+        use_coord_maps: bool = False
+    ) -> None:
+        super().__init__()
+        self.coarse_model = coarse_model
+        self.fine_model = fine_model
+        self.coarse_size = coarse_size
+        self.patch_size = patch_size
+        self.patch_overlap = patch_overlap
+        self.use_coord_maps = use_coord_maps
+        
+        self.stride = [s - o for s, o in zip(self.patch_size, self.patch_overlap)]
+        if any(st <= 0 for st in self.stride):
+            raise ValueError(f"Stride должен быть положительным! Убедитесь, что overlap меньше patch_size.")
+
+        self.coarse_model.eval()
+        self.fine_model.eval()
+
+    @torch.no_grad()
+    def forward(self, x_full: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = x_full.device
+        *_, D, H, W = x_full.shape
+        pd, ph, pw = self.patch_size
+        
+        # --- ЭТАП 1: Coarse модель ---
+        x_full_downsampled = F.interpolate(x_full, size=self.coarse_size, mode='trilinear', align_corners=False)
+        full_coarse_logits = self.coarse_model(x_full_downsampled)
+        full_coarse_map_upsampled = F.interpolate(
+            full_coarse_logits, size=x_full.shape[2:], mode='trilinear', align_corners=False
         )
-        coarse_pred = coarse_model(coarse_input)
         
-        # Растягиваем "подсказку" до полного размера
-        upsampled_coarse_pred = F.interpolate(
-            coarse_pred, 
-            size=full_image.shape[2:], 
-            mode='trilinear', 
-            align_corners=False
-        )
-        
-        # Объединяем входы для Fine-модели
-        fine_input_full = torch.cat([full_image, upsampled_coarse_pred], dim=1)
-        
-        # --- Шаг 2: Sliding Window Inference для Fine-модели ---
-        patch_size = config['PATCH_SIZE']
-        # Для инференса можно использовать большее перекрытие для лучшего качества
-        patch_overlap = tuple(p // 2 for p in patch_size) 
-        stride = [s - o for s, o in zip(patch_size, patch_overlap)]
-        
-        *_, D, H, W = fine_input_full.shape
-        
-        # Создаем холсты
-        prediction_canvas = torch.zeros_like(full_image, dtype=torch.float32, device=DEVICE)
-        weights_canvas = torch.zeros_like(full_image, dtype=torch.float32, device=DEVICE)
-        
-        # Создаем весовую маску (гауссово окно)
-        # Мы создаем ее на CPU с NumPy/SciPy, а затем переносим на GPU
-        gaussian_weights = np.zeros(patch_size)
-        center_coords = [p // 2 for p in patch_size]
-        gaussian_weights[center_coords[0], center_coords[1], center_coords[2]] = 1
-        # Сигма ~ 1/8 размера патча - хороший выбор
-        sigma = [p / 8 for p in patch_size]
-        gaussian_weights = gaussian_filter(gaussian_weights, sigma, mode='constant', cval=0)
-        # Нормализуем
-        gaussian_weights /= np.max(gaussian_weights)
-        gaussian_weights = torch.from_numpy(gaussian_weights).to(DEVICE).float()
 
-        # Цикл по патчам (исправленный, с паддингом для покрытия краев)
-        pad_d = (stride[0] - (D - patch_size[0]) % stride[0]) % stride[0]
-        pad_h = (stride[1] - (H - patch_size[1]) % stride[1]) % stride[1]
-        pad_w = (stride[2] - (W - patch_size[2]) % stride[2]) % stride[2]
-        padded_input = F.pad(fine_input_full, (0, pad_w, 0, pad_h, 0, pad_d))
-        
-        *_, D_pad, H_pad, W_pad = padded_input.shape
+        coord_maps_full = None
+        if self.use_coord_maps:
+            coord_maps_full = create_coordinate_maps((D, H, W), device)
 
-        for d in range(0, D_pad - patch_size[0] + 1, stride[0]):
-            for h in range(0, H_pad - patch_size[1] + 1, stride[1]):
-                for w in range(0, W_pad - patch_size[2] + 1, stride[2]):
-                    patch = padded_input[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]]
-                    
-                    # Получаем предсказание для патча
-                    seg_logits_patch, _ = fine_model(patch)
-                    
-                    # Применяем sigmoid, чтобы получить вероятности
-                    seg_probs_patch = torch.sigmoid(seg_logits_patch)
-                    
-                    # Добавляем взвешенное предсказание на холст
-                    prediction_canvas[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += seg_probs_patch * gaussian_weights
-                    weights_canvas[:, :, d:d+patch_size[0], h:h+patch_size[1], w:w+patch_size[2]] += gaussian_weights
+        # --- ЭТАП 2: Fine модель (Адаптивная логика) ---
+        is_large_enough_for_sliding = (D > pd) or (H > ph) or (W > pw)
         
-        # Нормализуем и обрезаем до исходного размера
-        final_prediction_probs = (prediction_canvas / (weights_canvas + 1e-8))[:, :, :D, :H, :W]
-        
-        # Применяем порог для получения бинарной маски
-        final_mask = (final_prediction_probs > 0.5).to(torch.uint8)
-        
-        return final_mask
+        if is_large_enough_for_sliding:
 
-# --- Пример использования после тренировки ---
-if __name__ == '__main__':
-    # 1. Загрузите ваши обученные модели
-    # coarse_model.load_state_dict(torch.load("coarse_model_epoch_100.pth"))
-    # fine_model.load_state_dict(torch.load("fine_model_epoch_100.pth"))
-    
-    # 2. Возьмите один сэмпл для предсказания из вашего датасета
-    # (здесь нужна логика загрузки одного скана, например, из H5)
-    # dataset = ModalityAwareH5Dataset(...)
-    # sample = dataset[0]
-    # full_scan = sample['image'].unsqueeze(0).to(DEVICE) # Добавляем batch измерение
-    
-    # 3. Соберите словарь с конфигурацией
-    # config = {
-    #     'PATCH_SIZE': PATCH_SIZE,
-    #     'COARSE_UNIFIED_SIZE': COARSE_UNIFIED_SIZE
-    # }
-    
-    # 4. Вызовите функцию предсказания
-    # final_mask = predict_full_volume(full_scan, coarse_model, fine_model, config)
-    
-    # print(f"Предсказание завершено. Форма финальной маски: {final_mask.shape}")
-    # Теперь `final_mask` можно сохранить в файл NIfTI или визуализировать.
-    pass
+            sd, sh, sw = self.stride
+            pad_d = (sd - (D - pd) % sd) % sd if D > pd else 0
+            pad_h = (sh - (H - ph) % sh) % sh if H > ph else 0
+            pad_w = (sw - (W - pw) % sw) % sw if W > pw else 0
+            
+            padded_x = F.pad(x_full, (0, pad_w, 0, pad_h, 0, pad_d))
+            padded_coarse_map = F.pad(full_coarse_map_upsampled, (0, pad_w, 0, pad_h, 0, pad_d))
+            padded_coord_maps = F.pad(coord_maps_full, (0, pad_w, 0, pad_h, 0, pad_d)) if self.use_coord_maps else None
+
+            *_, D_pad, H_pad, W_pad = padded_x.shape
+            padded_canvas = torch.zeros((x_full.shape[0], 1, D_pad, H_pad, W_pad), device=device)
+            padded_norm_map = torch.zeros_like(padded_canvas)
+            list_cls_logits = []
+
+            for d in range(0, D_pad - pd + 1, sd):
+                for h in range(0, H_pad - ph + 1, sh):
+                    for w in range(0, W_pad - pw + 1, sw):
+                        patch_x = padded_x[:, :, d:d+pd, h:h+ph, w:w+pw]
+                        patch_coarse = padded_coarse_map[:, :, d:d+pd, h:h+ph, w:w+pw]
+
+                        fine_input_list = [patch_x, patch_coarse]
+                        if self.use_coord_maps:
+                            patch_coord = padded_coord_maps[:, :, d:d+pd, h:h+ph, w:w+pw]
+                            fine_input_list.append(patch_coord)
+                        fine_input_patch = torch.cat(fine_input_list, dim=1)
+
+                        
+                        seg_logits_patch, cls_logits_patch = self.fine_model(fine_input_patch)
+                        
+                        padded_canvas[:, :, d:d+pd, h:h+ph, w:w+pw] += seg_logits_patch
+                        padded_norm_map[:, :, d:d+pd, h:h+ph, w:w+pw] += 1
+                        list_cls_logits.append(cls_logits_patch)
+            
+
+            if not list_cls_logits:
+                raise RuntimeError("Критическая ошибка: цикл инференса не выполнился.")
+            padded_norm_map[padded_norm_map == 0] = 1
+            final_seg_logits = (padded_canvas / padded_norm_map)[:, :, :D, :H, :W]
+            final_cls_logits = torch.stack(list_cls_logits).mean(dim=0)
+
+        else:
+            # --- СЛУЧАЙ 2: Изображение маленькое ---
+
+            padded_x = torch.zeros((x_full.shape[0], 1, pd, ph, pw), device=device)
+            padded_coarse_map = torch.zeros_like(padded_x)
+            padded_x[0, 0] = torch.from_numpy(pad_or_crop_to_shape(x_full.cpu().numpy()[0, 0], self.patch_size)).to(device)
+            padded_coarse_map[0, 0] = torch.from_numpy(pad_or_crop_to_shape(full_coarse_map_upsampled.cpu().numpy()[0, 0], self.patch_size)).to(device)
+
+
+            fine_input_list = [padded_x, padded_coarse_map]
+            if self.use_coord_maps:
+
+                padded_coord_maps = create_coordinate_maps(self.patch_size, device)
+                fine_input_list.append(padded_coord_maps)
+            fine_input = torch.cat(fine_input_list, dim=1)
+            # ----------------------------------------------
+
+            seg_logits_padded, final_cls_logits = self.fine_model(fine_input)
+
+            seg_logits_cropped_np = pad_or_crop_to_shape(seg_logits_padded.cpu().numpy()[0, 0], (D, H, W))
+            final_seg_logits = torch.from_numpy(seg_logits_cropped_np).to(device).unsqueeze(0).unsqueeze(0)
+
+        return final_seg_logits, final_cls_logits

@@ -24,3 +24,5 @@ fulladapters.py
 del.py
 *h5
 oldvers/
+mask_220825/training_pipeline2.py
+mask_220825/training_pipeline.py
