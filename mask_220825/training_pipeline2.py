@@ -504,7 +504,7 @@ def main():
     trainer.train()
     
     # Или восстанавливаем обучение с чекпоинта
-    # trainer.train(resume_from="./checkpoints/checkpoint_epoch_50.pth")
+    # trainer.train(resume_from="./checkpoints/checkpoint_epoch_3.pth")
 
 
 if __name__ == "__main__":

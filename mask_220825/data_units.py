@@ -722,7 +722,7 @@ class FullImageDataset(Dataset):
         print(f"Найдено {len(self.volumes_info)} полных 3D-объемов.")
 
     def __len__(self) -> int:
-        return 2
+        # return 2
         return len(self.volumes_info)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:

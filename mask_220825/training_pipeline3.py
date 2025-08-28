@@ -12,13 +12,41 @@ from typing import Tuple, Dict, Any, Optional
 try:
     from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE
     from data_units import FullImageDataset
-    from training_pipeline2 import DiceBCELoss 
     from inference import UnifiedPatchedModel 
 except ImportError as e:
     print(f"Ошибка импорта: {e}")
     exit()
 
 # --- Вспомогательные функции ---
+
+
+class DiceBCELoss(nn.Module):
+    """Комбинированная Dice + BCE функция потерь"""
+    def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0):
+        super().__init__()
+        self.dice_weight = dice_weight
+        self.bce_weight = bce_weight
+    
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6):
+        # Sigmoid активация
+        inputs_sigmoid = torch.sigmoid(inputs)
+        
+        # Flatten для вычислений
+        inputs_flat = inputs_sigmoid.reshape(-1)
+        targets_flat = targets.reshape(-1)
+        
+        # Dice loss
+        intersection = (inputs_flat * targets_flat).sum()
+        dice_loss = 1 - (2. * intersection + smooth) / (
+            inputs_flat.sum() + targets_flat.sum() + smooth
+        )
+        
+        # BCE loss
+        bce_loss = F.binary_cross_entropy(inputs_sigmoid, targets, reduction='mean')
+        
+        return self.dice_weight * dice_loss + self.bce_weight * bce_loss
+
+
 
 def create_coordinate_maps(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
     """
@@ -109,6 +137,17 @@ class AdvancedTrainer:
             in_channels=fine_in_channels,
             num_classes=len(dataset.modalities)
         ).to(self.device)
+        
+        if config["model_checkpoint_path"]: 
+            
+            save_point = torch.load(config["model_checkpoint_path"])
+            self.coarse_model.load_state_dict(save_point["coarse_model_state_dict"])
+            self.fine_model.load_state_dict(save_point["fine_model_state_dict"])
+            if config["load_optim"]:
+                self.optimizer.load_state_dict(save_point["optimizer_state_dict"])
+                self.scheduler.load_state_dict(save_point["scheduler_state_dict"])
+
+        
         
         # --- Настройка координатных карт---
         if config['use_coord_maps']:
@@ -293,7 +332,13 @@ def main_advanced_training():
 
         # Технические параметры
         'num_workers': 4,
-        'save_freq': 5
+        'save_freq': 5,
+        
+        
+        # Пути к сэйвам
+
+        "model_checkpoint_path":"",
+        "load_optim":True
     }
 
     print("--- Запуск продвинутого обучения ---")
