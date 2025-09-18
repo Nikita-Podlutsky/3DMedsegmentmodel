@@ -15,7 +15,6 @@ except ImportError as e:
     print(f"Ошибка импорта: {e}\nУбедитесь, что все необходимые файлы (.py) находятся в той же директории.")
     exit()
 
-# --- Основная функция ---
 
 def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
     device = torch.device(config['device'])
@@ -24,7 +23,7 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
         print(f"Ошибка: Файл чекпоинта не найден: {checkpoint_path}")
         return
 
-    # 1. Загрузка
+
     print(f"Загрузка чекпоинта из {checkpoint_path}...")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     train_config = checkpoint['config']
@@ -47,7 +46,6 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
     inference_model.eval()
     print("Модели успешно загружены.")
 
-    # 2. Загрузка данных
     dataset = FullImageDataset(config['h5_path'])
     sample = dataset[config['sample_idx']]
     full_image = sample['image'].unsqueeze(0).to(device)
@@ -55,18 +53,15 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
     full_image_np = sample['image'][0].cpu().numpy()
     print(f"Загружен сэмпл #{config['sample_idx']} (модальность: {sample['modality_name']})")
 
-    # 3. Получение полного предсказания (вероятностей)
     print("Выполнение предсказания на полном 3D-изображении...")
     with torch.no_grad():
         seg_logits, _ = inference_model(full_image)
-    
-    # Сохраняем вероятности (после сигмоиды), а не бинарную маску
+
     predicted_probs_np = torch.sigmoid(seg_logits)[0, 0].cpu().numpy()
     print("Предсказание завершено.")
 
-    # 4. Создание интерактивной панели
     fig, axes = plt.subplots(1, 3, figsize=(18, 7))
-    # Оставляем больше места внизу для двух ползунков
+
     plt.subplots_adjust(left=0.1, bottom=0.25) 
     fig.suptitle(f"Сравнение Результатов (Сэмпл #{config['sample_idx']}, Модальность: {sample['modality_name']})", fontsize=16)
 
@@ -76,16 +71,14 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
     
     # --- Функция обновления ---
     def update_plots(val):
-        # 'val' может приходить от любого ползунка, поэтому мы читаем текущие значения обоих
+        
         slice_idx = int(slice_slider.val)
         threshold = threshold_slider.val
         
         axis_idx = axis_map[current_axis]
         
-        # Обновляем бинарную маску предсказания на основе нового порога
         pred_mask_binary = (predicted_probs_np > threshold).astype(np.uint8)
-        
-        # Выбираем срезы из 3D-объемов
+
         if axis_idx == 0:
             img_slice = full_image_np[slice_idx, :, :]
             mask_slice = full_mask_np[slice_idx, :, :]
@@ -94,7 +87,7 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
             img_slice = full_image_np[:, slice_idx, :]
             mask_slice = full_mask_np[:, slice_idx, :]
             pred_slice = pred_mask_binary[:, slice_idx, :]
-        else: # axis_idx == 2
+        else:
             img_slice = full_image_np[:, :, slice_idx]
             mask_slice = full_mask_np[:, :, slice_idx]
             pred_slice = pred_mask_binary[:, :, slice_idx]
@@ -108,7 +101,7 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
         
         fig.canvas.draw_idle()
 
-    # --- Первичная отрисовка ---
+
     D, H, W = full_image_np.shape
     initial_slice = D // 2
     initial_threshold = 0.5
@@ -124,12 +117,11 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
     images[2] = axes[2].imshow(initial_pred_mask[initial_slice, :, :], cmap='gray', aspect='auto')
     axes[2].set_title(f'Предсказание Модели (Порог = {initial_threshold:.2f})')
 
-    # --- Создание виджетов ---
-    # Позиция для ползунка срезов
+
     ax_slice_slider = plt.axes([0.2, 0.1, 0.65, 0.03])
     slice_slider = Slider(ax_slice_slider, 'Срез', 0, D - 1, valinit=initial_slice, valstep=1)
-    
-    # Позиция для ползунка порога
+
+
     ax_threshold_slider = plt.axes([0.2, 0.05, 0.65, 0.03])
     threshold_slider = Slider(
         ax=ax_threshold_slider,
@@ -137,13 +129,12 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
         valmin=0.0,
         valmax=1.0,
         valinit=initial_threshold,
-        valfmt='%0.2f' # Формат отображения значения
+        valfmt='%0.2f'
     )
     
     ax_radio = plt.axes([0.01, 0.7, 0.07, 0.2])
     radio = RadioButtons(ax_radio, ('Аксиальный (D)', 'Сагиттальный (H)', 'Корональный (W)'), active=0)
 
-    # --- Функция для смены оси ---
     def select_axis(label):
         nonlocal current_axis
         current_axis = label
@@ -152,20 +143,19 @@ def inspect_full_prediction_with_threshold(config: Dict[str, Any]):
         slice_slider.valmax = max_slices - 1
         slice_slider.set_val(max_slices // 2)
 
-    # --- Подключение функций к виджетам ---
     slice_slider.on_changed(update_plots)
-    threshold_slider.on_changed(update_plots) # Оба ползунка вызывают одну и ту же функцию
+    threshold_slider.on_changed(update_plots)
     radio.on_clicked(select_axis)
 
     plt.tight_layout(rect=[0.1, 0.1, 1, 0.95])
     plt.show()
 if __name__ == '__main__':
-    # --- НАСТРОЙТЕ ЭТИ ПАРАМЕТРЫ ---
+
     INSPECTION_CONFIG = {
         'h5_path': r"C:\Users\pniki\Documents\Programs\Datasets\synthstrip_prepared_golden.h5",
-        'checkpoint_path': r"C:\Users\pniki\Documents\Programs\ML\Исследования\MEd\mask_220825\checkpoints\checkpoint_epoch_3.pth",
+        'checkpoint_path': r"C:\Users\pniki\Documents\Programs\ML\Исследования\MEd\mask_220825\checkpoints\checkpoint_epoch_30.pth",
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'sample_idx': 230 # Выберите индекс сэмпла из вашего датасета для инспекции
+        'sample_idx': 20
     }
     
     inspect_full_prediction_with_threshold(INSPECTION_CONFIG)
@@ -335,9 +325,154 @@ if __name__ == '__main__':
 #     # --- НАСТРОЙТЕ ЭТИ ПАРАМЕТРЫ ---
 #     ANALYSIS_CONFIG = {
 #         'h5_path': r"C:\Users\pniki\Documents\Programs\Datasets\synthstrip_prepared_golden.h5",
-#         'checkpoint_path': r"C:\Users\pniki\Documents\Programs\ML\Исследования\MEd\mask_220825\checkpoints\checkpoint_epoch_3.pth",
+#         'checkpoint_path': r"C:\Users\pniki\Documents\Programs\ML\Исследования\MEd\mask_220825\checkpoints\best_model.pth",
 #         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
 #         'num_random_samples': 10
 #     }
     
 #     analyze_thresholds_for_dataset(ANALYSIS_CONFIG)
+
+
+
+
+
+# # File: visualize_nifti_prediction.py
+
+# import nibabel as nib
+# import numpy as np
+# import matplotlib.pyplot as plt
+# from matplotlib.widgets import Slider, RadioButtons
+# from pathlib import Path
+# from typing import Tuple
+
+# def visualize_scan_and_mask(image_path: str, mask_path: str):
+#     """
+#     Создает интерактивную панель для сравнения NIfTI изображения и его маски.
+
+#     Args:
+#         image_path (str): Путь к исходному NIfTI файлу.
+#         mask_path (str): Путь к предсказанному NIfTI файлу маски.
+#     """
+#     image_p = Path(image_path)
+#     mask_p = Path(mask_path)
+
+#     if not image_p.exists() or not mask_p.exists():
+#         print("Ошибка: Один или оба файла не найдены.")
+#         print(f"Проверьте пути:\n- Изображение: {image_p}\n- Маска: {mask_p}")
+#         return
+
+#     # 1. Загрузка данных
+#     print("Загрузка NIfTI файлов...")
+#     try:
+#         image_nii = nib.load(image_p)
+#         mask_nii = nib.load(mask_p)
+        
+#         image_data = image_nii.get_fdata()
+#         mask_data = mask_nii.get_fdata()
+
+#         # Убедимся, что маска бинарная
+#         mask_data = (mask_data > 0).astype(np.uint8)
+#     except Exception as e:
+#         print(f"Не удалось загрузить файлы. Ошибка: {e}")
+#         return
+        
+#     print("Данные успешно загружены.")
+#     print(f"Размер изображения: {image_data.shape}")
+
+#     # 2. Создание интерактивной панели
+#     fig, axes = plt.subplots(1, 2, figsize=(15, 8))
+#     plt.subplots_adjust(left=0.1, bottom=0.2)
+#     fig.suptitle("Интерактивный просмотр предсказания", fontsize=16)
+
+#     # Глобальные переменные для управления состоянием
+#     current_axis_name = 'Аксиальный (Z)'
+#     # Nibabel обычно загружает данные в порядке (X, Y, Z)
+#     axis_map = {'Аксиальный (Z)': 2, 'Сагиттальный (X)': 0, 'Корональный (Y)': 1}
+    
+#     # --- Функция обновления, вызываемая виджетами ---
+#     def update_plots(val):
+#         slice_idx = int(slice_slider.val)
+#         axis_idx = axis_map[current_axis_name]
+        
+#         # Выбираем срезы в зависимости от оси
+#         if axis_idx == 2: # Аксиальный
+#             img_slice = image_data[:, :, slice_idx].T
+#             mask_slice = mask_data[:, :, slice_idx].T
+#         elif axis_idx == 0: # Сагиттальный
+#             img_slice = image_data[slice_idx, :, :].T
+#             mask_slice = mask_data[slice_idx, :, :].T
+#         else: # Корональный
+#             img_slice = image_data[:, slice_idx, :].T
+#             mask_slice = mask_data[:, slice_idx, :].T
+            
+#         # Создаем маску с прозрачностью, где 0 - полностью прозрачный
+#         # Это нужно, чтобы фон не закрашивался
+#         alpha_mask = np.where(mask_slice > 0, 0.4, 0) # 40% непрозрачности для маски
+
+#         # Обновляем данные на графиках
+#         images['image'].set_data(img_slice)
+#         images['overlay_img'].set_data(img_slice)
+#         images['overlay_mask'].set_data(mask_slice)
+#         images['overlay_mask'].set_alpha(alpha_mask) # Обновляем прозрачность
+        
+#         axes[0].set_title(f'Исходное Изображение (срез {slice_idx})')
+#         axes[1].set_title(f'Предсказание (наложение)')
+        
+#         fig.canvas.draw_idle()
+
+#     # --- Первичная отрисовка ---
+#     initial_axis_idx = axis_map[current_axis_name]
+#     initial_slice_idx = image_data.shape[initial_axis_idx] // 2
+    
+#     # Получаем начальные срезы
+#     initial_img_slice = image_data[:, :, initial_slice_idx].T
+#     initial_mask_slice = mask_data[:, :, initial_slice_idx].T
+#     initial_alpha_mask = np.where(initial_mask_slice > 0, 0.4, 0)
+    
+#     images = {}
+#     axes[0].set_title(f'Исходное Изображение (срез {initial_slice_idx})')
+#     images['image'] = axes[0].imshow(initial_img_slice, cmap='gray', aspect='equal')
+    
+#     axes[1].set_title(f'Предсказание (наложение)')
+#     images['overlay_img'] = axes[1].imshow(initial_img_slice, cmap='gray', aspect='equal')
+#     images['overlay_mask'] = axes[1].imshow(initial_mask_slice, cmap='viridis', alpha=initial_alpha_mask, aspect='equal')
+    
+#     # --- Создание виджетов ---
+#     ax_slider = plt.axes([0.2, 0.05, 0.65, 0.03])
+#     slice_slider = Slider(
+#         ax=ax_slider,
+#         label='Срез',
+#         valmin=0,
+#         valmax=image_data.shape[initial_axis_idx] - 1,
+#         valinit=initial_slice_idx,
+#         valstep=1
+#     )
+    
+#     ax_radio = plt.axes([0.02, 0.4, 0.07, 0.2])
+#     radio = RadioButtons(ax_radio, ('Аксиальный (Z)', 'Корональный (Y)', 'Сагиттальный (X)'), active=0)
+
+#     # --- Функция для смены оси ---
+#     def select_axis(label):
+#         nonlocal current_axis_name
+#         current_axis_name = label
+#         axis_idx = axis_map[current_axis_name]
+        
+#         max_slices = image_data.shape[axis_idx] - 1
+#         slice_slider.valmax = max_slices
+#         slice_slider.set_val(max_slices // 2) # Устанавливаем на центральный срез новой оси
+
+#     # --- Подключение функций к виджетам ---
+#     slice_slider.on_changed(update_plots)
+#     radio.on_clicked(select_axis)
+
+#     plt.tight_layout(rect=[0.1, 0.1, 1, 0.95])
+#     plt.show()
+
+# if __name__ == '__main__':
+#     # --- НАСТРОЙТЕ ЭТИ ДВА ПУТИ ---
+    
+#     INPUT_NIFTI_FILE = r"C:\Users\pniki\Documents\Programs\Datasets\SynthRad\23\1BA082\mr.nii.gz"
+#     PREDICTED_MASK_FILE = r"C:\Users\pniki\Documents\Programs\ML\Исследования\MEd\mask_220825\ct.nii.gz"
+
+#     # --- Запуск визуализатора ---
+#     visualize_scan_and_mask(INPUT_NIFTI_FILE, PREDICTED_MASK_FILE)

@@ -699,13 +699,13 @@ def get_prepared_synthstrip_dataset(dataset_dir, h5_cache_path, config, force_cr
 class FullImageDataset(Dataset):
     """
     Dataset, который загружает и возвращает полные 3D-изображения из H5 файла.
-    Предназначен для продвинутого обучения, где требуется глобальный контекст.
     """
     def __init__(self, h5_path: str, augmentations: Optional[Any] = None):
         self.h5_path = h5_path
         self.augmentations = augmentations
         
         self.volumes_info = []
+        h5_path = get_prepared_synthstrip_dataset(r"C:\Users\pniki\Documents\Programs\Datasets\synthstrip_data_v1.5", h5_path, SYNTHSTRIP_PROCESSING_CONFIG)
         with h5py.File(h5_path, 'r') as hf:
             self.modalities = sorted(list(hf.keys()))
             self.modality_map = {name: i for i, name in enumerate(self.modalities)}
@@ -722,7 +722,7 @@ class FullImageDataset(Dataset):
         print(f"Найдено {len(self.volumes_info)} полных 3D-объемов.")
 
     def __len__(self) -> int:
-        # return 2
+
         return len(self.volumes_info)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:

@@ -3,38 +3,165 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MoELayer(nn.Module):
 
-    def __init__(self, in_channels, out_channels, num_experts=4):
+class PowerfulResBlock3D(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, 
+                 width_multiplier=2, use_se=True, dropout_rate=0.1):
+        super().__init__()
+        mid_channels = max(in_channels, out_channels) * width_multiplier
+        
+        self.conv1 = nn.Conv3d(in_channels, mid_channels, kernel_size=3, stride=stride, padding=1)
+        self.bn1 = nn.BatchNorm3d(mid_channels)
+        self.dropout1 = nn.Dropout3d(dropout_rate)
+        
+        self.conv2 = nn.Conv3d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm3d(mid_channels)
+        self.dropout2 = nn.Dropout3d(dropout_rate)
+        
+        self.conv3 = nn.Conv3d(mid_channels, out_channels, kernel_size=1)
+        self.bn3 = nn.BatchNorm3d(out_channels)
+
+        self.use_se = use_se
+        if use_se:
+            reduction = max(1, out_channels // 16)
+            self.se = nn.Sequential(
+                nn.AdaptiveAvgPool3d(1),
+                nn.Conv3d(out_channels, reduction, kernel_size=1),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(reduction, out_channels, kernel_size=1),
+                nn.Sigmoid()
+            )
+        
+
+        self.shortcut = nn.Identity()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride),
+                nn.BatchNorm3d(out_channels)
+            )
+    
+    def forward(self, x):
+        residual = x
+        
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.dropout1(out)
+        
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.dropout2(out)
+        
+        out = self.bn3(self.conv3(out))
+        
+        if self.use_se:
+            se_weight = self.se(out)
+            out = out * se_weight
+        
+        shortcut_out = self.shortcut(residual)
+        
+        out += shortcut_out
+        out = F.relu(out)
+        return out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class MoELayer(nn.Module):
+    def __init__(self, in_channels, out_channels, num_experts=4, k=2):
         super().__init__()
         self.num_experts = num_experts
+        self.k = min(k, num_experts)
 
-        self.experts = nn.ModuleList(
-            [ResBlock3D(in_channels, out_channels) for _ in range(num_experts)]
-        )
+        self.experts = nn.ModuleList([
+            PowerfulResBlock3D(in_channels, out_channels) for _ in range(num_experts)
+        ])
+
+
+        self.gating_network =   nn.Sequential(
+                                nn.Conv3d(in_channels, in_channels // 2, kernel_size=3, padding=1),
+                                nn.ReLU(),
+                                nn.AdaptiveAvgPool3d(1),
+                                nn.Flatten(),
+                                nn.Linear(in_channels // 2, num_experts)
+                            )
+
+        self.register_buffer('expert_usage_count', torch.zeros(num_experts))
+        self.register_buffer('total_samples', torch.tensor(0.0))
         
-
-        self.gating_network = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels, num_experts),
-            nn.Softmax(dim=1)
-        )
-
     def forward(self, x):
-        weights = self.gating_network(x)
-
-        expert_outputs = [expert(x) for expert in self.experts]
-
-        stacked_outputs = torch.stack(expert_outputs, dim=0)
-
-        stacked_outputs = stacked_outputs.permute(1, 0, 2, 3, 4, 5)
-
-        weights = weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-
-        mixed_output = (stacked_outputs * weights).sum(dim=1)
+        raw_weights = self.gating_network(x)
+        if self.training:
+            noise = torch.randn_like(raw_weights) * 1e-2
+            raw_weights += noise
+            
+        top_k_weights, top_k_indices = torch.topk(raw_weights, k=self.k, dim=1)
+        top_k_weights = F.softmax(top_k_weights, dim=1)
         
-        return mixed_output
+        if self.training:
+            self._update_expert_usage(top_k_indices)
+        
+        with torch.no_grad():
+            sample_input = torch.zeros(1, *x.shape[1:], device=x.device, dtype=x.dtype)
+            sample_output = self.experts[0](sample_input)
+            output_channels = sample_output.shape[1]
+
+        output_shape = list(x.shape)
+        output_shape[1] = output_channels
+        output = torch.zeros(output_shape, device=x.device, dtype=x.dtype)
+        
+        for i in range(self.k):
+            expert_indices = top_k_indices[:, i]
+            expert_weights = top_k_weights[:, i:i+1]
+            
+            unique_experts = torch.unique(expert_indices)
+            
+            for expert_idx in unique_experts:
+                mask = (expert_indices == expert_idx)
+                if not mask.any():
+                    continue
+                
+                expert_input = x[mask]
+                expert_weight = expert_weights[mask]
+                
+                expert_output = self.experts[expert_idx](expert_input)
+                weighted_output = expert_output * expert_weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                output[mask] += weighted_output
+        
+        return output
+    
+    def _update_expert_usage(self, top_k_indices):
+        batch_size = top_k_indices.shape[0]
+        for expert_idx in range(self.num_experts):
+            usage = (top_k_indices == expert_idx).float().sum()
+            self.expert_usage_count[expert_idx] += usage
+        
+        self.total_samples += batch_size * self.k
+    
+    def get_load_balancing_loss(self):
+        if self.total_samples == 0:
+            return torch.tensor(0.0, device=self.expert_usage_count.device)
+
+        usage_freq = self.expert_usage_count / self.total_samples
+
+        ideal_freq = 1.0 / self.num_experts
+
+        load_balancing_loss = torch.sum((usage_freq - ideal_freq) ** 2)
+        
+        return load_balancing_loss
+    
+    def reset_usage_stats(self):
+        """Сбрасывает статистику использования"""
+        self.expert_usage_count.zero_()
+        self.total_samples.zero_()
 
 class ResBlock3D(nn.Module):
 
@@ -123,7 +250,34 @@ class FineUNet_MoE(nn.Module):
         
         return final_out
 
+class MoETrainingManager:
+    """Помощник для управления load balancing loss во время обучения"""
 
+    def __init__(self, model, load_balance_weight=0.01):
+        self.model = model
+        self.load_balance_weight = load_balance_weight
+        
+    def compute_total_loss(self, main_loss):
+        """Вычисляет общий loss включая load balancing"""
+        total_loss = main_loss
+        total_load_balance_loss = 0.0
+        
+        for module in self.model.modules():
+            if isinstance(module, MoELayer):
+                lb_loss = module.get_load_balancing_loss()
+                total_load_balance_loss += lb_loss
+        
+        if total_load_balance_loss > 0:
+            total_loss = total_loss + self.load_balance_weight * total_load_balance_loss
+            
+        return total_loss, total_load_balance_loss
+    
+    def reset_stats_if_needed(self, epoch, reset_frequency=10):
+
+        if epoch % reset_frequency == 0:
+            for module in self.model.modules():
+                if isinstance(module, MoELayer):
+                    module.reset_usage_stats()
 
 class MultiTask_FineUNet_MoE(nn.Module):
 
@@ -264,3 +418,4 @@ class PatchedFineModel(nn.Module):
         final_cls_logits = torch.stack(list_cls_logits).mean(dim=0)
         
         return final_seg_logits, final_cls_logits
+

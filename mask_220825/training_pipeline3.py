@@ -1,5 +1,3 @@
-# File: training_pipeline3.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,41 +5,40 @@ from tqdm import tqdm
 from pathlib import Path
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
-
+import wandb
 
 try:
-    from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE
+    from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE, MoETrainingManager
     from data_units import FullImageDataset
-    from inference import UnifiedPatchedModel 
+    from inference import UnifiedPatchedModel
 except ImportError as e:
     print(f"Ошибка импорта: {e}")
     exit()
 
-# --- Вспомогательные функции ---
+
 
 
 class DiceBCELoss(nn.Module):
-    """Комбинированная Dice + BCE функция потерь"""
+    
     def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0):
         super().__init__()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
     
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6):
-        # Sigmoid активация
+
         inputs_sigmoid = torch.sigmoid(inputs)
         
-        # Flatten для вычислений
+
         inputs_flat = inputs_sigmoid.reshape(-1)
         targets_flat = targets.reshape(-1)
         
-        # Dice loss
+
         intersection = (inputs_flat * targets_flat).sum()
         dice_loss = 1 - (2. * intersection + smooth) / (
             inputs_flat.sum() + targets_flat.sum() + smooth
         )
-        
-        # BCE loss
+
         bce_loss = F.binary_cross_entropy(inputs_sigmoid, targets, reduction='mean')
         
         return self.dice_weight * dice_loss + self.bce_weight * bce_loss
@@ -66,8 +63,8 @@ def create_coordinate_maps(shape: Tuple[int, ...], device: torch.device) -> torc
     return coord_maps
 
 def sample_random_patch(
-    image_vol: torch.Tensor, 
-    mask_vol: torch.Tensor, 
+    image_vol: torch.Tensor,
+    mask_vol: torch.Tensor,
     coarse_map_vol: torch.Tensor,
     coord_maps_vol: Optional[torch.Tensor],
     patch_size: Tuple[int, int, int]
@@ -93,11 +90,10 @@ def sample_random_patch(
     
     return image_patch, mask_patch, coarse_map_patch, coord_patch
 
-# --- Основной класс тренера ---
 
 class AdvancedTrainer:
     """
-    Реализует продвинутый пайплайн обучения с глобальным контекстом 
+    Реализует продвинутый пайплайн обучения с глобальным контекстом
     и корректной валидацией.
     """
     def __init__(
@@ -106,8 +102,7 @@ class AdvancedTrainer:
     ):
         self.config = config
         self.device = torch.device(config['device'])
-        
-        # --- Настройка данных c разделением на train/val ---
+
         print("Настройка данных...")
         dataset = FullImageDataset(config['h5_path'])
         dataset_size = len(dataset)
@@ -124,7 +119,14 @@ class AdvancedTrainer:
         self.val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, sampler=val_sampler, num_workers=config.get('num_workers', 2))
         print(f"Данные разделены: {len(train_indices)} train, {len(val_indices)} validation.")
 
-        # --- Настройка моделей ---
+        if config["use_wandb"]:
+            wandb.init(project="brain-segmentation", config={
+                "patch_size": config["fine_patch_size"],
+                "batch_size": 1,
+                "learning_rate": config["learning_rate"],
+                "num_epochs": config["num_epochs"]
+            })
+
         print("Инициализация моделей...")
         self.coarse_model = CoarseUNet_Medium(base_filters=16).to(self.device)
         
@@ -137,23 +139,14 @@ class AdvancedTrainer:
             in_channels=fine_in_channels,
             num_classes=len(dataset.modalities)
         ).to(self.device)
-        
-        if config["model_checkpoint_path"]: 
-            
-            save_point = torch.load(config["model_checkpoint_path"])
-            self.coarse_model.load_state_dict(save_point["coarse_model_state_dict"])
-            self.fine_model.load_state_dict(save_point["fine_model_state_dict"])
-            if config["load_optim"]:
-                self.optimizer.load_state_dict(save_point["optimizer_state_dict"])
-                self.scheduler.load_state_dict(save_point["scheduler_state_dict"])
+        self.moe_manager = MoETrainingManager(self.fine_model, load_balance_weight=0.01)
 
         
         
-        # --- Настройка координатных карт---
+
         if config['use_coord_maps']:
             self.coord_maps_cache = {}
         
-        # --- Настройка обучения ---
         print("Настройка компонентов обучения...")
         params = list(self.coarse_model.parameters()) + list(self.fine_model.parameters())
         self.optimizer = torch.optim.AdamW(params, lr=config['learning_rate'])
@@ -163,7 +156,6 @@ class AdvancedTrainer:
         self.criterion_seg = DiceBCELoss()
         self.criterion_cls = nn.CrossEntropyLoss()
         
-        # --- Настройка модели для инференса (используется в валидации) ---
         self.inference_model = UnifiedPatchedModel(
             coarse_model=self.coarse_model,
             fine_model=self.fine_model,
@@ -175,9 +167,19 @@ class AdvancedTrainer:
         self.best_val_dice = 0.0
         self.save_dir = Path(config['save_dir'])
         self.save_dir.mkdir(exist_ok=True)
+        if config["model_checkpoint_path"]:
+            
+            save_point = torch.load(config["model_checkpoint_path"])
+            self.coarse_model.load_state_dict(save_point["coarse_model_state_dict"])
+            self.fine_model.load_state_dict(save_point["fine_model_state_dict"])
+            if config["load_optim"]:
+                self.optimizer.load_state_dict(save_point["optimizer_state_dict"])
+                self.scheduler.load_state_dict(save_point["scheduler_state_dict"])
+
         print("AdvancedTrainer готов к работе.")
 
     def train_epoch(self):
+        self.moe_manager.reset_stats_if_needed(self.current_epoch)
         self.coarse_model.train()
         self.fine_model.train()
         progress_bar = tqdm(self.train_loader, desc=f"Обучение Эпоха {self.current_epoch}")
@@ -196,7 +198,6 @@ class AdvancedTrainer:
 
             self.optimizer.zero_grad()
             
-            # ЭТАП 1: COARSE МОДЕЛЬ
             image_downsampled = F.interpolate(full_image, size=self.config['coarse_input_size'], mode='trilinear', align_corners=False)
             mask_downsampled = F.interpolate(full_mask, size=self.config['coarse_input_size'], mode='nearest')
             coarse_logits_full = self.coarse_model(image_downsampled)
@@ -205,7 +206,6 @@ class AdvancedTrainer:
                 coarse_logits_full.detach(), size=full_image.shape[2:], mode='trilinear', align_corners=False
             )
 
-            # ЭТАП 2: FINE МОДЕЛЬ
             total_loss_fine_seg, total_loss_fine_cls = 0.0, 0.0
             for _ in range(self.config['patches_per_volume']):
                 img_patch, mask_patch, coarse_map_patch, coord_patch = sample_random_patch(
@@ -223,11 +223,17 @@ class AdvancedTrainer:
             avg_loss_fine_seg = total_loss_fine_seg / self.config['patches_per_volume']
             avg_loss_fine_cls = total_loss_fine_cls / self.config['patches_per_volume']
             
-            # ОБЪЕДИНЕНИЕ ПОТЕРЬ И ОБРАТНОЕ РАСПРОСТРАНЕНИЕ
             total_loss = loss_coarse + avg_loss_fine_seg + 0.2 * avg_loss_fine_cls
+            total_loss, lb_loss = self.moe_manager.compute_total_loss(total_loss)
             total_loss.backward()
             self.optimizer.step()
-            
+            if self.config.get('use_wandb'):
+                wandb.log({
+                    'train_loss_total': total_loss.item(),
+                    'train_loss_coarse': loss_coarse.item(),
+                    'load_balance_loss': lb_loss.item() if lb_loss else 0,
+                    'learning_rate': self.optimizer.param_groups[0]['lr']
+                })
             progress_bar.set_postfix({
                 'L_total': f"{total_loss.item():.4f}",
                 'L_coarse': f"{loss_coarse.item():.4f}",
@@ -305,38 +311,37 @@ class AdvancedTrainer:
             if (epoch % self.config.get('save_freq', 5) == 0) or is_best:
                 self.save_checkpoint(epoch, is_best=is_best)
 
-        print(f"\n🎉 Обучение завершено! Лучший Dice score на валидации: {self.best_val_dice:.4f}")
+        print(f"\nОбучение завершено! Лучший Dice score на валидации: {self.best_val_dice:.4f}")
 
-# --- Точка входа для запуска обучения ---
+
 
 def main_advanced_training():
     """Главная функция для конфигурации и запуска AdvancedTrainer."""
     
-    # Конфигурация обучения
+    
     config = {
         'h5_path': r"C:\Users\pniki\Documents\Programs\Datasets\synthstrip_prepared_golden.h5",
         'save_dir': "./mask_220825/checkpoints",
         'device': "cuda" if torch.cuda.is_available() else "cpu",
         
-        # Параметры данных и моделей
         'coarse_input_size': (128, 128, 128),
         'fine_patch_size': (64, 64, 64),
         'fine_patch_overlap': (32, 32, 32),
         'use_coord_maps': True,
         'patches_per_volume': 8,
         
-        # Параметры обучения
         'num_epochs': 150,
-        'learning_rate': 1e-4,
+        'learning_rate': 1e-2,
         'validation_split': 0.5,
 
-        # Технические параметры
         'num_workers': 4,
         'save_freq': 5,
         
-        
+        'use_wandb': False,
+        'wandb_project': 'med_segmentation',
         # Пути к сэйвам
 
+        # "model_checkpoint_path":r"C:\Users\pniki\Documents\Programs\ML\Исследования\MEd\mask_220825\checkpoints\best_model.pth",
         "model_checkpoint_path":"",
         "load_optim":True
     }
