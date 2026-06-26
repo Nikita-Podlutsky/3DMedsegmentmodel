@@ -14,8 +14,9 @@ import pandas as pd
 import torch
 import torchio as tio
 from scipy.ndimage import zoom
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
+
 
 SYNTHSTRIP_GOLDEN_STANDARD_SHAPES = {
     'dwi': (128, 128, 64),
@@ -472,8 +473,8 @@ class PrePatchedDataset(Dataset):
             image_patch = hf[modality]['images'][volume_idx][d:d+pd, h:h+ph, w:w+pw, :]
             mask_patch = hf[modality]['masks'][volume_idx][d:d+pd, h:h+ph, w:w+pw, :]
 
-        image_tensor = torch.from_numpy(image_patch.transpose(3, 2, 1, 0)).float()  # (C, W, H, D)
-        mask_tensor = torch.from_numpy(mask_patch.transpose(3, 2, 1, 0)).float()    # (C, W, H, D)
+        image_tensor = torch.from_numpy(image_patch.transpose(3, 0, 1, 2)).float()
+        mask_tensor = torch.from_numpy(mask_patch.transpose(3, 0, 1, 2)).float()
 
         if self.augmentations:
             subject = tio.Subject(
@@ -525,7 +526,9 @@ def create_optimized_dataloaders(
         augmentations=augmentations,
         min_foreground_ratio=0.00,
         overlap=(32, 32, 32)
-    )[:10]
+    )
+    
+    train_dataset = Subset(train_dataset, range(min(10, len(train_dataset))))
     
     val_dataset = PrePatchedDataset(
         h5_path=h5_path,
@@ -534,7 +537,7 @@ def create_optimized_dataloaders(
         overlap=(32, 32, 32),
         augmentations=None,
         min_foreground_ratio=0.0
-    )[:10]
+    )
 
     train_loader = DataLoader(
         train_dataset, 
@@ -694,35 +697,52 @@ def get_prepared_synthstrip_dataset(dataset_dir, h5_cache_path, config, force_cr
         return h5_cache_path
 
 
-
-
 class FullImageDataset(Dataset):
     """
-    Dataset, который загружает и возвращает полные 3D-изображения из H5 файла.
-    Предназначен для продвинутого обучения, где требуется глобальный контекст.
+    Dataset, который загружает полные 3D-изображения из H5 файла 
+    или генерирует легковесные синтетические данные в режиме mock.
     """
-    def __init__(self, h5_path: str, augmentations: Optional[Any] = None):
+    def __init__(
+        self, 
+        h5_path: str, 
+        augmentations: Optional[Any] = None, 
+        mock: bool = False, 
+        num_mock_volumes: int = 4
+    ):
         self.h5_path = h5_path
         self.augmentations = augmentations
+        self.mock = mock
         
         self.volumes_info = []
-        with h5py.File(h5_path, 'r') as hf:
-            self.modalities = sorted(list(hf.keys()))
+        
+        if self.mock:
+            self.modalities = ['t1', 't2', 'flair']
             self.modality_map = {name: i for i, name in enumerate(self.modalities)}
-            
-            print("Сканирование полных объемов для FullImageDataset...")
             for modality in self.modalities:
-                num_volumes = len(hf[modality]['images'])
-                for vol_idx in range(num_volumes):
+                for vol_idx in range(num_mock_volumes):
                     self.volumes_info.append({
                         'modality': modality,
                         'volume_idx': vol_idx,
                         'modality_label': self.modality_map[modality]
                     })
-        print(f"Найдено {len(self.volumes_info)} полных 3D-объемов.")
+            print(f"[!] ВНИМАНИЕ: Инициализирован MOCK-режим. Сгенерировано {len(self.volumes_info)} синтетических объемов.")
+        else:
+            with h5py.File(h5_path, 'r') as hf:
+                self.modalities = sorted(list(hf.keys()))
+                self.modality_map = {name: i for i, name in enumerate(self.modalities)}
+                
+                print("Сканирование полных объемов для FullImageDataset...")
+                for modality in self.modalities:
+                    num_volumes = len(hf[modality]['images'])
+                    for vol_idx in range(num_volumes):
+                        self.volumes_info.append({
+                            'modality': modality,
+                            'volume_idx': vol_idx,
+                            'modality_label': self.modality_map[modality]
+                        })
+            print(f"Найдено {len(self.volumes_info)} полных 3D-объемов в H5.")
 
     def __len__(self) -> int:
-        # return 2
         return len(self.volumes_info)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -730,12 +750,27 @@ class FullImageDataset(Dataset):
         modality = info['modality']
         volume_idx = info['volume_idx']
 
-        with h5py.File(self.h5_path, 'r') as hf:
+        if self.mock:
+            # Создаем небольшой куб 64x64x64, чтобы обучение шло мгновенно
+            shape = (64, 64, 64, 1)
+            # Рандомный шум (имитация МРТ ткани)
+            image_volume = (np.random.randn(*shape) * 0.1 + 0.5).astype(np.float32)
+            
+            # Создаем маску в виде сферы в центре объема
+            mask_volume = np.zeros(shape, dtype=np.uint8)
+            z, y, x, _ = np.indices(shape)
+            center = 32
+            radius = 12
+            sphere = (z - center)**2 + (y - center)**2 + (x - center)**2 < radius**2
+            mask_volume[sphere] = 1
+            # Слегка подсвечиваем зону маски на "снимке" для симуляции сигнала
+            image_volume[sphere] += 0.4
+        else:
+            with h5py.File(self.h5_path, 'r') as hf:
+                image_volume = hf[modality]['images'][volume_idx][...]
+                mask_volume = hf[modality]['masks'][volume_idx][...]
 
-            image_volume = hf[modality]['images'][volume_idx][...]
-            mask_volume = hf[modality]['masks'][volume_idx][...]
-
-
+        # Консистентный транспоз (C, D, H, W)
         image_tensor = torch.from_numpy(image_volume.transpose(3, 0, 1, 2)).float()
         mask_tensor = torch.from_numpy(mask_volume.transpose(3, 0, 1, 2)).float()
 

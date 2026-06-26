@@ -6,7 +6,7 @@ from matplotlib.widgets import Slider, RadioButtons
 from pathlib import Path
 from typing import Tuple, Dict, Any
 
-# --- Импорты из вашего проекта ---
+# --- Импорты из проекта ---
 try:
     from data_units import FullImageDataset
     from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE

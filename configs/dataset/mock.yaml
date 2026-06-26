@@ -1,0 +1,6 @@
+# @package _global_
+dataset:
+  mock: true
+  h5_path: ""
+  validation_split: 0.3
+  num_mock_volumes: 4

@@ -93,9 +93,10 @@ class UnifiedPatchedModel(nn.Module):
         if is_large_enough_for_sliding:
 
             sd, sh, sw = self.stride
-            pad_d = (sd - (D - pd) % sd) % sd if D > pd else 0
-            pad_h = (sh - (H - ph) % sh) % sh if H > ph else 0
-            pad_w = (sw - (W - pw) % sw) % sw if W > pw else 0
+
+            pad_d = (sd - (D - pd) % sd) % sd if D > pd else (pd - D)
+            pad_h = (sh - (H - ph) % sh) % sh if H > ph else (ph - H)
+            pad_w = (sw - (W - pw) % sw) % sw if W > pw else (pw - W)
             
             padded_x = F.pad(x_full, (0, pad_w, 0, pad_h, 0, pad_d))
             padded_coarse_map = F.pad(full_coarse_map_upsampled, (0, pad_w, 0, pad_h, 0, pad_d))

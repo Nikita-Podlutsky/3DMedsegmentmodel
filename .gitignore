@@ -1,28 +1,30 @@
-# Python-generated files
+# --- Виртуальное окружение и кэш Python ---
+.venv/
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-ExpertCheckpoints/
-LDM_Checkpoints/
-*.egg-info
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.hydra/
 
-# Virtual environments
-.venv
-.env
-# .python-version
-.pytest_cache
-.ruff_cache
+# --- Системные файлы операционных систем ---
+Thumbs.db
+.DS_Store
 
+# --- Локальные медицинские данные (HDF5 и NIfTI) ---
+*.h5
+*.nii.gz
+raw_data/
+data/
 
-test_adapters.py
-sample/
-synthRAD2025_Task1_Train/
-fulltransforms.py
-fulladapters.py
-del.py
-*h5
-oldvers/
-mask_220825/training_pipeline2.py
-mask_220825/training_pipeline.py
+# --- Логи и папки автоматических запусков Hydra ---
+outputs/
+multirun/
+
+# --- Настройки сред разработки (IDE) ---
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp

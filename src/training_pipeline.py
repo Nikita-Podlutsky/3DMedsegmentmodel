@@ -1,4 +1,4 @@
-# File: training_pipeline3.py
+# File: training_pipeline.py
 
 import torch
 import torch.nn as nn
@@ -7,7 +7,8 @@ from tqdm import tqdm
 from pathlib import Path
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
-
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 try:
     from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE
@@ -21,17 +22,15 @@ except ImportError as e:
 
 
 class DiceBCELoss(nn.Module):
-    """Комбинированная Dice + BCE функция потерь"""
     def __init__(self, dice_weight: float = 1.0, bce_weight: float = 1.0):
         super().__init__()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
     
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6):
-        # Sigmoid активация
         inputs_sigmoid = torch.sigmoid(inputs)
         
-        # Flatten для вычислений
+        # Flatten для Dice
         inputs_flat = inputs_sigmoid.reshape(-1)
         targets_flat = targets.reshape(-1)
         
@@ -41,8 +40,8 @@ class DiceBCELoss(nn.Module):
             inputs_flat.sum() + targets_flat.sum() + smooth
         )
         
-        # BCE loss
-        bce_loss = F.binary_cross_entropy(inputs_sigmoid, targets, reduction='mean')
+        # Численно стабильный BCE с логитами напрямую
+        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='mean')
         
         return self.dice_weight * dice_loss + self.bce_weight * bce_loss
 
@@ -100,19 +99,40 @@ class AdvancedTrainer:
     Реализует продвинутый пайплайн обучения с глобальным контекстом 
     и корректной валидацией.
     """
-    def __init__(
-        self,
-        config: Dict[str, Any]
-    ):
+    def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.device = torch.device(config['device'])
         
-        # --- Настройка данных c разделением на train/val ---
+        # --- Настройка данных ---
         print("Настройка данных...")
-        dataset = FullImageDataset(config['h5_path'])
+        
+        
+        
+        # Делаем извлечение параметров совместимым и с Hydra (вложенный конфиг), 
+        # и с классическим словарем (плоский конфиг)
+        dataset_cfg = config.get('dataset')
+        if isinstance(dataset_cfg, dict):
+            # Hydra-стиль (вложенная конфигурация)
+            h5_path = dataset_cfg.get('h5_path', '')
+            mock = dataset_cfg.get('mock', False)
+            num_mock_volumes = dataset_cfg.get('num_mock_volumes', 4)
+            validation_split = dataset_cfg.get('validation_split', 0.15)
+        else:
+            # Классический плоский стиль (fallback-логика)
+            h5_path = config.get('h5_path', '')
+            mock = config.get('mock', False)
+            num_mock_volumes = config.get('num_mock_volumes', 4)
+            validation_split = config.get('validation_split', 0.15)
+
+        dataset = FullImageDataset(
+            h5_path=h5_path,
+            mock=mock,
+            num_mock_volumes=num_mock_volumes
+        )
+        
         dataset_size = len(dataset)
         indices = list(range(dataset_size))
-        split = int(np.floor(config['validation_split'] * dataset_size))
+        split = int(np.floor(validation_split * dataset_size))
         np.random.seed(42)
         np.random.shuffle(indices)
         train_indices, val_indices = indices[split:], indices[:split]
@@ -120,8 +140,12 @@ class AdvancedTrainer:
         train_sampler = torch.utils.data.SubsetRandomSampler(train_indices)
         val_sampler = torch.utils.data.SubsetRandomSampler(val_indices)
 
-        self.train_loader = torch.utils.data.DataLoader(dataset, batch_size=1, sampler=train_sampler, num_workers=config.get('num_workers', 2))
-        self.val_loader = torch.utils.data.DataLoader(dataset, batch_size=1, sampler=val_sampler, num_workers=config.get('num_workers', 2))
+        self.train_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, sampler=train_sampler, num_workers=config.get('num_workers', 0)
+        )
+        self.val_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, sampler=val_sampler, num_workers=config.get('num_workers', 0)
+        )
         print(f"Данные разделены: {len(train_indices)} train, {len(val_indices)} validation.")
 
         # --- Настройка моделей ---
@@ -138,38 +162,42 @@ class AdvancedTrainer:
             num_classes=len(dataset.modalities)
         ).to(self.device)
         
-        if config["model_checkpoint_path"]: 
-            
-            save_point = torch.load(config["model_checkpoint_path"])
-            self.coarse_model.load_state_dict(save_point["coarse_model_state_dict"])
-            self.fine_model.load_state_dict(save_point["fine_model_state_dict"])
-            if config["load_optim"]:
-                self.optimizer.load_state_dict(save_point["optimizer_state_dict"])
-                self.scheduler.load_state_dict(save_point["scheduler_state_dict"])
-
-        
-        
-        # --- Настройка координатных карт---
-        if config['use_coord_maps']:
-            self.coord_maps_cache = {}
-        
         # --- Настройка обучения ---
         print("Настройка компонентов обучения...")
         params = list(self.coarse_model.parameters()) + list(self.fine_model.parameters())
         self.optimizer = torch.optim.AdamW(params, lr=config['learning_rate'])
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', patience=5, factor=0.5, verbose=True
+            self.optimizer, mode='max', patience=5, factor=0.5
         )
         self.criterion_seg = DiceBCELoss()
         self.criterion_cls = nn.CrossEntropyLoss()
         
-        # --- Настройка модели для инференса (используется в валидации) ---
+        self.start_epoch = 1
+        # Загрузка чекпоинта
+        if config.get("model_checkpoint_path"): 
+            save_point = torch.load(config["model_checkpoint_path"], map_location=self.device)
+            self.coarse_model.load_state_dict(save_point["coarse_model_state_dict"])
+            self.fine_model.load_state_dict(save_point["fine_model_state_dict"])
+            
+            # [ДОБАВЛЕНО СЮДА] Считываем сохраненную эпоху из чекпоинта
+            self.start_epoch = save_point.get('epoch', 0) + 1
+            print(f"[*] Чекпоинт загружен. Продолжаем обучение с эпохи {self.start_epoch}")
+
+            if config["load_optim"]:
+                self.optimizer.load_state_dict(save_point["optimizer_state_dict"])
+                self.scheduler.load_state_dict(save_point["scheduler_state_dict"])
+
+        # Настройка координатных карт
+        if config['use_coord_maps']:
+            self.coord_maps_cache = {}
+            
+        # Настройка модели для инференса
         self.inference_model = UnifiedPatchedModel(
             coarse_model=self.coarse_model,
             fine_model=self.fine_model,
-            coarse_size=config['coarse_input_size'],
-            patch_size=config['fine_patch_size'],
-            patch_overlap=config['fine_patch_overlap'],
+            coarse_size=tuple(config['coarse_input_size']),
+            patch_size=tuple(config['fine_patch_size']),
+            patch_overlap=tuple(config['fine_patch_overlap']),
             use_coord_maps=config['use_coord_maps']
         )
         self.best_val_dice = 0.0
@@ -283,7 +311,7 @@ class AdvancedTrainer:
             print(f"🏆 Обновлен лучший чекпоинт: {best_filename} (Dice: {self.best_val_dice:.4f})")
 
     def train(self, num_epochs: int):
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(self.start_epoch, num_epochs + 1):
             self.current_epoch = epoch
             print(f"\n{'='*25} Эпоха {epoch}/{num_epochs} {'='*25}")
             
@@ -309,43 +337,20 @@ class AdvancedTrainer:
 
 # --- Точка входа для запуска обучения ---
 
-def main_advanced_training():
-    """Главная функция для конфигурации и запуска AdvancedTrainer."""
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main_advanced_training(cfg: DictConfig):
+    # Превращаем DictConfig в обычный словарь Python
+    config = OmegaConf.to_container(cfg, resolve=True)
     
-    # Конфигурация обучения
-    config = {
-        'h5_path': r"C:\Users\pniki\Documents\Programs\Datasets\synthstrip_prepared_golden.h5",
-        'save_dir': "./mask_220825/checkpoints",
-        'device': "cuda" if torch.cuda.is_available() else "cpu",
+    # Автоматический выбор девайса
+    if torch.cuda.is_available():
+        config['device'] = 'cuda'
+    else:
+        config['device'] = 'cpu'
         
-        # Параметры данных и моделей
-        'coarse_input_size': (128, 128, 128),
-        'fine_patch_size': (64, 64, 64),
-        'fine_patch_overlap': (32, 32, 32),
-        'use_coord_maps': True,
-        'patches_per_volume': 8,
-        
-        # Параметры обучения
-        'num_epochs': 150,
-        'learning_rate': 1e-4,
-        'validation_split': 0.5,
-
-        # Технические параметры
-        'num_workers': 4,
-        'save_freq': 5,
-        
-        
-        # Пути к сэйвам
-
-        "model_checkpoint_path":"",
-        "load_optim":True
-    }
-
-    print("--- Запуск продвинутого обучения ---")
-    print("Конфигурация:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-    print("---------------------------------")
+    print("--- Запуск продвинутого обучения (Hydra) ---")
+    print(OmegaConf.to_yaml(cfg))
+    print("---------------------------------------------")
     
     trainer = AdvancedTrainer(config=config)
     trainer.train(num_epochs=config['num_epochs'])

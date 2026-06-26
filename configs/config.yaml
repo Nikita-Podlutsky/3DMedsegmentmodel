@@ -1,0 +1,12 @@
+defaults:
+  - dataset: mock
+  - mode: demo
+  - _self_
+
+save_dir: "./checkpoints"
+device: "cpu"
+use_coord_maps: true
+num_workers: 0
+save_freq: 5
+model_checkpoint_path: ""
+load_optim: true

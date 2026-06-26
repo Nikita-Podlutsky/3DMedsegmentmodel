@@ -1,0 +1,5 @@
+# @package _global_
+dataset:
+  mock: false
+  h5_path: "C:\\Users\\pniki\\Documents\\Programs\\Datasets\\synthstrip_prepared_golden.h5"
+  validation_split: 0.15
