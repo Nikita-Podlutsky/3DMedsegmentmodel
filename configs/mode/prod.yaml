@@ -2,7 +2,7 @@
 mode_name: "prod"
 num_epochs: 150
 learning_rate: 1e-4
-coarse_input_size: [128, 128, 128]
-fine_patch_size: [64, 64, 64]
-fine_patch_overlap: [32, 32, 32]
-patches_per_volume: 8
+coarse_input_size: [64, 64, 64]
+fine_patch_size: [16, 16, 16]
+fine_patch_overlap: [8, 8, 8]
+patches_per_volume: 4

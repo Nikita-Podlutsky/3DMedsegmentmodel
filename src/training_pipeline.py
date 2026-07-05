@@ -11,9 +11,9 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 try:
-    from models import CoarseUNet_Medium, MultiTask_FineUNet_MoE
+    from models import CoarseUNet, FineUNet
     from data_units import FullImageDataset
-    from inference import UnifiedPatchedModel 
+    from inference import UnifiedPatchedModel
 except ImportError as e:
     print(f"Ошибка импорта: {e}")
     exit()
@@ -150,16 +150,22 @@ class AdvancedTrainer:
 
         # --- Настройка моделей ---
         print("Инициализация моделей...")
-        self.coarse_model = CoarseUNet_Medium(base_filters=16).to(self.device)
+        # Передаем количество классов для головы классификации в CoarseUNet
+        self.coarse_model = CoarseUNet(
+            base_filters=16,
+            num_classes=len(dataset.modalities)
+        ).to(self.device)
         
         fine_in_channels = 2
         if config['use_coord_maps']:
             fine_in_channels += 3
             print("Обучение с явным позиционным кодированием (координатные карты).")
             
-        self.fine_model = MultiTask_FineUNet_MoE(
+        # Используем обновленный FineUNet без лишних голов классификации
+        self.fine_model = FineUNet(
             in_channels=fine_in_channels,
-            num_classes=len(dataset.modalities)
+            num_classes=len(dataset.modalities),
+            num_experts=config.get('num_experts', 4)  # берем из конфига или 4 по умолчанию
         ).to(self.device)
         
         # --- Настройка обучения ---
@@ -196,8 +202,8 @@ class AdvancedTrainer:
             coarse_model=self.coarse_model,
             fine_model=self.fine_model,
             coarse_size=tuple(config['coarse_input_size']),
-            patch_size=tuple(config['fine_patch_size']),
-            patch_overlap=tuple(config['fine_patch_overlap']),
+            patch_size=(64, 64, 64),  # Жестко ставим крупный патч для валидации
+            patch_overlap=(0, 0, 0),  # Убираем перекрытие для максимальной скорости
             use_coord_maps=config['use_coord_maps']
         )
         self.best_val_dice = 0.0
@@ -224,17 +230,20 @@ class AdvancedTrainer:
 
             self.optimizer.zero_grad()
             
-            # ЭТАП 1: COARSE МОДЕЛЬ
+            # ЭТАП 1: COARSE МОДЕЛЬ (Прогон целого сжатого скана)
             image_downsampled = F.interpolate(full_image, size=self.config['coarse_input_size'], mode='trilinear', align_corners=False)
             mask_downsampled = F.interpolate(full_mask, size=self.config['coarse_input_size'], mode='nearest')
-            coarse_logits_full = self.coarse_model(image_downsampled)
+            
+            # Извлекаем маску и глобальные логиты класса (модальности)
+            coarse_logits_full, cls_logits = self.coarse_model(image_downsampled)
             loss_coarse = self.criterion_seg(coarse_logits_full, mask_downsampled)
+            
             coarse_map_upsampled = F.interpolate(
                 coarse_logits_full.detach(), size=full_image.shape[2:], mode='trilinear', align_corners=False
             )
 
             # ЭТАП 2: FINE МОДЕЛЬ
-            total_loss_fine_seg, total_loss_fine_cls = 0.0, 0.0
+            total_loss_fine_seg = 0.0
             for _ in range(self.config['patches_per_volume']):
                 img_patch, mask_patch, coarse_map_patch, coord_patch = sample_random_patch(
                     full_image, full_mask, coarse_map_upsampled, coord_maps_full, self.config['fine_patch_size']
@@ -244,22 +253,25 @@ class AdvancedTrainer:
                     fine_input_list.append(coord_patch)
                 fine_input = torch.cat(fine_input_list, dim=1)
                 
-                seg_preds_patch, cls_preds_patch = self.fine_model(fine_input)
+                # Передаем логиты классификации во Fine-модель для локального роутинга экспертов
+                seg_preds_patch = self.fine_model(fine_input, cls_logits)
                 total_loss_fine_seg += self.criterion_seg(seg_preds_patch, mask_patch)
-                total_loss_fine_cls += self.criterion_cls(cls_preds_patch, modality_label)
 
             avg_loss_fine_seg = total_loss_fine_seg / self.config['patches_per_volume']
-            avg_loss_fine_cls = total_loss_fine_cls / self.config['patches_per_volume']
+            
+            # Считаем лосс классификации по логитам Coarse-модели
+            loss_cls = self.criterion_cls(cls_logits, modality_label)
             
             # ОБЪЕДИНЕНИЕ ПОТЕРЬ И ОБРАТНОЕ РАСПРОСТРАНЕНИЕ
-            total_loss = loss_coarse + avg_loss_fine_seg + 0.2 * avg_loss_fine_cls
+            total_loss = loss_coarse + avg_loss_fine_seg + 0.2 * loss_cls
             total_loss.backward()
             self.optimizer.step()
             
             progress_bar.set_postfix({
                 'L_total': f"{total_loss.item():.4f}",
                 'L_coarse': f"{loss_coarse.item():.4f}",
-                'L_fine_seg': f"{avg_loss_fine_seg.item():.4f}"
+                'L_fine_seg': f"{avg_loss_fine_seg.item():.4f}",
+                'L_cls': f"{loss_cls.item():.4f}"
             })
 
     def _compute_dice(self, preds: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-6) -> float:
