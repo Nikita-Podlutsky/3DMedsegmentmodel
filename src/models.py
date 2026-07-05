@@ -62,7 +62,7 @@ class MoEBlock3D(nn.Module):
         stacked_outputs = stacked_outputs.permute(1, 0, 2, 3, 4, 5)  # (Batch, num_experts, C, D, H, W)
 
         # Расширяем веса для совместимости с формой тензора выходов
-        weights = weights.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        weights = weights.view(-1, self.num_experts, 1, 1, 1, 1)
         mixed_output = (stacked_outputs * weights).sum(dim=1)
         
         return mixed_output
@@ -187,6 +187,7 @@ class PatchedFineModel(nn.Module):
         self.patch_overlap = patch_overlap
         self.stride = [s - o for s, o in zip(patch_size, patch_overlap)]
 
+    @torch.no_grad()
     def forward(self, x_full, x_coarse_full, cls_logits):
         fine_input_full = torch.cat([x_full, x_coarse_full], dim=1)
 
