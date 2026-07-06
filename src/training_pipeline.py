@@ -176,7 +176,7 @@ class AdvancedTrainer:
             self.optimizer, mode='max', patience=5, factor=0.5
         )
         self.criterion_seg = DiceBCELoss()
-        self.criterion_cls = nn.CrossEntropyLoss()
+        self.criterion_cls = nn.CrossEntropyLoss(label_smoothing=0.1)
         
         self.start_epoch = 1
         # Загрузка чекпоинта
@@ -254,7 +254,7 @@ class AdvancedTrainer:
                 fine_input = torch.cat(fine_input_list, dim=1)
                 
                 # Передаем логиты классификации во Fine-модель для локального роутинга экспертов
-                seg_preds_patch = self.fine_model(fine_input, cls_logits)
+                seg_preds_patch = self.fine_model(fine_input, cls_logits.detach())
                 total_loss_fine_seg += self.criterion_seg(seg_preds_patch, mask_patch)
 
             avg_loss_fine_seg = total_loss_fine_seg / self.config['patches_per_volume']
@@ -263,8 +263,14 @@ class AdvancedTrainer:
             loss_cls = self.criterion_cls(cls_logits, modality_label)
             
             # ОБЪЕДИНЕНИЕ ПОТЕРЬ И ОБРАТНОЕ РАСПРОСТРАНЕНИЕ
-            total_loss = loss_coarse + avg_loss_fine_seg + 0.2 * loss_cls
+            total_loss = loss_coarse + avg_loss_fine_seg + 0.05 * loss_cls
             total_loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(
+                list(self.coarse_model.parameters()) + list(self.fine_model.parameters()), 
+                max_norm=1.0
+            )
+            
             self.optimizer.step()
             
             progress_bar.set_postfix({
